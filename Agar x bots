@@ -1,0 +1,850 @@
+// build_node.js — writes the full Node.js tree and zips it
+const fs = require('fs');
+const path = require('path');
+const { execSync } = require('child_process');
+
+const ROOT = 'biteyt_node';
+if (!fs.existsSync(ROOT)) fs.mkdirSync(ROOT);
+
+const FILES = {
+  'package.json': `{
+  "name": "biteyt-node",
+  "version": "4.0.0",
+  "main": "run.js",
+  "dependencies": {
+    "axios": "^1.7.2",
+    "express": "^4.19.2",
+    "ws": "^8.17.0"
+  }
+}`,
+
+  'protocol.js': `
+function makeVersion(rev = 0) {
+    const buf = Buffer.alloc(5);
+    buf.writeUInt8(0x01, 0);
+    buf.writeUInt32LE(rev, 1);
+    return buf;
+}
+
+function makeSpawn(name) {
+    const nameBuf = Buffer.from(name, 'utf16le');
+    const buf = Buffer.alloc(1 + nameBuf.length + 2);
+    buf.writeUInt8(0x00, 0);
+    nameBuf.copy(buf, 1);
+    buf.writeUInt16LE(0, 1 + nameBuf.length); // 0x0000 terminator
+    return buf;
+}
+
+function makeUpdate(mx, my, split = 0, eject = 0, flags = 0) {
+    const buf = Buffer.alloc(12);
+    buf.writeUInt8(0x03, 0);
+    buf.writeInt32LE(mx, 1);
+    buf.writeInt32LE(my, 5);
+    buf.writeUInt8(split, 9);
+    buf.writeUInt8(eject, 10);
+    buf.writeUInt8(flags, 11);
+    return buf;
+}
+
+function makePing(ts = 0) {
+    const buf = Buffer.alloc(5);
+    buf.writeUInt8(0x02, 0);
+    buf.writeUInt32LE(ts, 1);
+    return buf;
+}
+
+function opName(op) {
+    const names = {
+        0x10: "UpdateNodes", 0x14: "ClearAll", 0x15: "ClearMyCells",
+        0x20: "AddNode", 0x31: "UpdatePos", 0x32: "AddMyCell",
+        0x40: "Camera", 0x41: "SetRadius", 0x42: "SetCenter",
+        0x49: "Leaderboard", 0x64: "SetBorder", 0xF0: "SetNickname"
+    };
+    return names[op] || \`0x\${op.toString(16).toUpperCase()}\`;
+}
+
+module.exports = { makeVersion, makeSpawn, makeUpdate, makePing, opName };
+`,
+
+  'discovery.js': `
+const axios = require('axios');
+
+async function findServer(mode = 'ffa') {
+    const r = await axios.post('https://m.agar.io/findServer', \`\${mode}\\n\`, {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        responseType: 'text'
+    });
+    const parts = r.data.trim().split('\\n');
+    return { uri: \`wss://\${parts[0]}\`, key: parts[1] || '' };
+}
+
+async function findServerRetry(mode = 'ffa', tries = 3) {
+    for (let i = 0; i < tries; i++) {
+        try { return await findServer(mode); } catch (e) {}
+    }
+    throw new Error('findServer failed after retries');
+}
+
+async function resolveUri(source) {
+    if (!source || source === 'ffa') return await findServerRetry('ffa');
+    if (source.startsWith('party:')) {
+        const code = source.split(':')[1].trim();
+        const r = await axios.post('https://m.agar.io/findServer', \`\\x00\${code}\\nffa\`, {
+            headers: { 'User-Agent': 'Mozilla/5.0' },
+            responseType: 'text'
+        });
+        const parts = r.data.trim().split('\\n');
+        return { uri: \`wss://\${parts[0]}\`, key: parts[1] || '' };
+    }
+    if (source.startsWith('ws://') || source.startsWith('wss://')) {
+        return { uri: source, key: '' };
+    }
+    throw new Error(\`unknown source: \${source}\`);
+}
+
+module.exports = { findServer, findServerRetry, resolveUri };
+`,
+
+  'profiles.js': `
+const NAME_POOL = [
+    "Alex","Sam","Jordan","Taylor","Casey","Morgan","Riley","Avery",
+    "Quinn","Hayden","Peyton","Reese","Drew","Rowan","Skyler","Emery",
+    "Kai","Ash","Blake","Cameron","Dakota","Elliot","Finley","Harper",
+    "Indigo","Jules","Kendall","Lane","Marlow","Nova","Oakley","Parker",
+    "Remy","Sage","Tatum","Vale","Wren","Yuki","Zephyr","River"
+];
+
+const BEHAVIORS = {
+    "aggressive": { aggression: 0.9, split_range_mult: 2.0, split_size_mult: 1.4, eject_rate: 0.0, target_food: false, flee_radius: 0.0 },
+    "farmer":     { aggression: 0.1, split_range_mult: 0.8, split_size_mult: 3.0, eject_rate: 0.0, target_food: true,  flee_radius: 400.0 },
+    "feeder":     { aggression: 0.0, split_range_mult: 0.5, split_size_mult: 5.0, eject_rate: 8.0, target_food: false, flee_radius: 0.0 },
+    "sniper":     { aggression: 0.7, split_range_mult: 1.2, split_size_mult: 2.0, eject_rate: 0.0, target_food: false, flee_radius: 600.0 },
+    "trail":      { aggression: 0.1, split_range_mult: 0.8, split_size_mult: 3.0, eject_rate: 0.0, target_food: false, flee_radius: 300.0 },
+    "healer":     { aggression: 0.0, split_range_mult: 0.5, split_size_mult: 5.0, eject_rate: 10.0,target_food: true,  flee_radius: 0.0 }
+};
+
+function pickName() { return NAME_POOL[Math.floor(Math.random() * NAME_POOL.length)]; }
+function profile(name) { return BEHAVIORS[name] || BEHAVIORS["aggressive"]; }
+
+class MacroSeq {
+    constructor(steps) { this.steps = steps; this.t0 = null; this.i = 0; }
+    start(now) { this.t0 = now; this.i = 0; }
+    tick(now) {
+        if (this.t0 === null) return [null, false, false];
+        while (this.i < this.steps.length) {
+            const [delay, action] = this.steps[this.i];
+            if (now - this.t0 < delay) break;
+            this.i++;
+            if (action === "split") return ["split", true, false];
+            if (action === "eject") return ["eject", false, true];
+        }
+        if (this.i >= this.steps.length) this.t0 = null;
+        return [null, false, false];
+    }
+}
+
+const MACROS = {
+    quad_split: new MacroSeq([[0.00,"split"],[0.20,"split"],[0.40,"split"],[0.60,"split"]]),
+    fast_eject: new MacroSeq(Array.from({length: 12}, (_, i) => [i*0.12, "eject"])),
+    split_pop:  new MacroSeq([[0.00,"split"],[0.15,"eject"],[0.35,"split"]])
+};
+
+module.exports = { pickName, profile, MACROS };
+`,
+
+  'agar_client.js': `
+const WebSocket = require('ws');
+const p = require('./protocol');
+
+class AgarClient {
+    constructor(ws_uri, nickname, proxy = null, auth_token = "", profile_name = "aggressive", custom_name = "", mimic_name = "", verbose = false) {
+        this.ws_uri = ws_uri;
+        this.nickname = custom_name || mimic_name || nickname;
+        this.proxy = proxy;
+        this.auth_token = auth_token;
+        this.profile_name = profile_name;
+        this.verbose = verbose;
+
+        this.alive = false;
+        this.kicked = false;
+        this.reconnect_count = 0;
+        this.spawn_sent = false;
+        this.spawn_confirmed = false;
+        this.server_key = "";
+        this.me = null;
+        this.nodes = new Map();
+        this.leaderboard = [];
+        this.center = [0.0, 0.0];
+        this.radius = 1000.0;
+        this.last_ops = [];
+
+        this.ws = null;
+        this.pingTimer = null;
+        this.last_split = 0.0;
+        this.last_eject = 0.0;
+        this.dead_since = null;
+        this.tick_hz = 0.0;
+        this.tick_count = 0;
+        this.tick_window = Date.now();
+        this.macro = null;
+        this.jitter_side = Math.random() > 0.5 ? 1 : -1;
+        this.jitter_phase = Math.random() * 0.6 + 0.3;
+    }
+
+    connect() {
+        return new Promise((resolve, reject) => {
+            let uri = this.ws_uri;
+            if (this.server_key && !uri.includes('?')) uri += \`?key=\${this.server_key}\`;
+            
+            const headers = {
+                "Origin": "https://agar.io",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            };
+            if (this.auth_token) headers["Cookie"] = \`auth_token=\${this.auth_token}\`;
+
+            // Note: proxy requires https-proxy-agent, skipping for simple node ws for now
+            this.ws = new WebSocket(uri, { headers, maxPayload: 2**24 });
+
+            this.ws.on('open', () => {
+                this.ws.send(p.makeVersion());
+                this.ws.send(p.makeSpawn(this.nickname));
+                this.spawn_sent = true;
+                this.kicked = false;
+                this.startPing();
+                resolve();
+            });
+
+            this.ws.on('message', (data) => this.read(data));
+            this.ws.on('close', () => { this.alive = false; this.kicked = true; this.stopPing(); });
+            this.ws.on('error', (e) => { reject(e); });
+        });
+    }
+
+    startPing() {
+        this.stopPing();
+        this.pingTimer = setInterval(() => {
+            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                this.ws.send(p.makePing(Date.now()));
+            }
+        }, 5000);
+    }
+
+    stopPing() { if (this.pingTimer) clearInterval(this.pingTimer); }
+
+    read(msg) {
+        if (!Buffer.isBuffer(msg) || msg.length === 0) return;
+        const op = msg.readUInt8(0);
+        this.last_ops.push(op);
+        if (this.last_ops.length > 32) this.last_ops.shift();
+
+        if (this.verbose) console.log(\`[\${this.nickname}] <- \${p.opName(op)} (\${msg.length}B)\`);
+
+        if (op === 0x32) {
+            const cid = msg.readUInt32LE(1);
+            this.alive = true;
+            this.spawn_confirmed = true;
+            this.me = { id: cid, x: 0.0, y: 0.0, size: 0.0 };
+            this.dead_since = null;
+            if (this.verbose) console.log(\`[\${this.nickname}] SPAWN CONFIRMED id=\${cid}\`);
+        } else if (op === 0x15) {
+            this.alive = false; this.me = null; this.dead_since = Date.now();
+        } else if (op === 0x14) {
+            this.nodes.clear(); this.alive = false; this.me = null;
+        } else if (op === 0x20) {
+            const nid = msg.readUInt32LE(1);
+            if (!this.nodes.has(nid)) {
+                const x = msg.readUInt16LE(5);
+                const y = msg.readUInt16LE(7);
+                const size = msg.readUInt16LE(9);
+                this.nodes.set(nid, { x, y, size });
+            }
+        } else if (op === 0x31) {
+            const nid = msg.readUInt32LE(1);
+            const nx = msg.readInt16LE(5);
+            const ny = msg.readInt16LE(7);
+            const n = this.nodes.get(nid);
+            if (n) { n.x = nx; n.y = ny; }
+            if (this.me && nid === this.me.id) { this.me.x = nx; this.me.y = ny; }
+        } else if (op === 0x42) {
+            this.center = [msg.readDoubleLE(1), msg.readDoubleLE(9)];
+        } else if (op === 0x41) {
+            this.radius = msg.readDoubleLE(1);
+        }
+    }
+
+    async respawnIfDead() {
+        if (this.alive || this.dead_since === null) return;
+        const now = Date.now();
+        if (now - this.dead_since < 1200) return;
+        try {
+            this.ws.send(p.makeSpawn(this.nickname));
+            this.dead_since = now;
+        } catch (e) { this.alive = false; this.kicked = true; }
+    }
+
+    jitter(tx, ty) {
+        if (!this.me) return [tx, ty];
+        const mag = Math.hypot(tx - this.me.x, ty - this.me.y) || 1.0;
+        const bow = (1 - this.jitter_phase) * mag * 0.12;
+        const px = -(ty - this.me.y) / mag * bow * this.jitter_side;
+        const py =  (tx - this.me.x) / mag * bow * this.jitter_side;
+        return [tx + px, ty + py];
+    }
+
+    async steer(tx, ty, want_split = false, want_eject = false, freeze = false) {
+        if (!this.ws || !this.alive || !this.me || freeze) return;
+        [tx, ty] = this.jitter(tx, ty);
+        const dx = tx - this.me.x; const dy = ty - this.me.y;
+        const mag = Math.hypot(dx, dy) || 1.0;
+        const s = Math.min(1.0, 500.0 / mag);
+        const mx = Math.trunc(dx * s); const my = Math.trunc(dy * s);
+        
+        const now = Date.now();
+        let split = 0, eject = 0;
+        if (want_split && now - this.last_split > 1200) { split = 1; this.last_split = now; }
+        if (want_eject && now - this.last_eject > 120) { eject = 1; this.last_eject = now; }
+        
+        if (this.macro) {
+            const [_, ms, me] = this.macro.tick(now);
+            if (ms) split = 1;
+            if (me) eject = 1;
+            if (this.macro.t0 === null) this.macro = null;
+        }
+        try {
+            this.ws.send(p.makeUpdate(mx, my, split, eject));
+            this.tick_count++;
+            const el = Date.now() - this.tick_window;
+            if (el >= 1000) {
+                this.tick_hz = this.tick_count / (el / 1000);
+                this.tick_count = 0; this.tick_window = Date.now();
+            }
+        } catch (e) { this.alive = false; this.kicked = true; }
+    }
+
+    fireMacro(name) {
+        const m = require('./profiles').MACROS[name];
+        if (m) { m.start(Date.now()); this.macro = m; }
+    }
+
+    close() {
+        this.stopPing();
+        if (this.ws) this.ws.close();
+    }
+}
+module.exports = AgarClient;
+`,
+
+  'fleet.js': `
+const AgarClient = require('./agar_client');
+const { profile, pickName } = require('./profiles');
+
+class Fleet {
+    constructor(ws_uri, auth_token = "", proxies = [], target_uid = 0, target_name = "", profile_name = "aggressive", party_code = "", mimic_name = false, trail_mode = false, heal_mode = false, reconnect = true, verbose = false) {
+        this.ws_uri = ws_uri;
+        this.auth_token = auth_token;
+        this.proxies = proxies.filter(p => p.trim()).length > 0 ? proxies.filter(p => p.trim()) : [null];
+        this.party_code = party_code;
+        this.target_uid = parseInt(target_uid) || 0;
+        this.target_name = target_name;
+        this.locked_uid = null;
+        this.profile_name = profile_name;
+        this.mimic_name = mimic_name;
+        this.trail_mode = trail_mode;
+        this.heal_mode = heal_mode;
+        this.reconnect = reconnect;
+        this.verbose = verbose;
+        
+        this.cursor = null;
+        this.freeze = false;
+        this.clients = {};
+        this.order = [];
+        this.spawn_i = 0;
+        this.running = false;
+        this.loopTimer = null;
+    }
+
+    async connectWithBackoff(c, tries = 4) {
+        for (let i = 0; i < tries; i++) {
+            try {
+                await c.connect();
+                return true;
+            } catch (e) {
+                if (this.verbose) console.log(\`[fleet] connect fail \${i}: \${e.message}\`);
+                const idx = this.proxies.indexOf(c.proxy);
+                c.proxy = this.proxies[(idx + 1) % this.proxies.length];
+                await new Promise(r => setTimeout(r, 2000 ** i));
+            }
+        }
+        return false;
+    }
+
+    async spawnOne(name = null, profile_name = null) {
+        const pname = profile_name || this.profile_name;
+        const nick = name || pickName();
+        const bot_id = \`bt\${String(this.spawn_i++).padStart(2, '0')}\`;
+        const proxy = this.proxies[Object.keys(this.clients).length % this.proxies.length];
+        const mimic = (this.mimic_name && this.target_name) ? this.target_name : "";
+        
+        const c = new AgarClient(this.ws_uri, bot_id, proxy, this.auth_token, pname, nick, mimic, this.verbose);
+        const ok = await this.connectWithBackoff(c);
+        if (!ok) return \`spawn failed: \${bot_id}\`;
+        
+        this.clients[bot_id] = c;
+        this.order.push(bot_id);
+        
+        if (!this.running) {
+            this.running = true;
+            this.loop();
+        }
+        return \`spawned \${bot_id} name=\${c.nickname} profile=\${pname} alive=\${c.alive}\`;
+    }
+
+    async spawnMany(n, profile_name = null) {
+        const out = [];
+        for (let i = 0; i < n; i++) {
+            out.push(await this.spawnOne(null, profile_name));
+            await new Promise(r => setTimeout(r, 200));
+        }
+        return out;
+    }
+
+    async killOne(name) {
+        const c = this.clients[name];
+        if (!c) return \`no bot \${name}\`;
+        delete this.clients[name];
+        const idx = this.order.indexOf(name);
+        if (idx > -1) this.order.splice(idx, 1);
+        c.close();
+        return \`killed \${name}\`;
+    }
+
+    async killAll() {
+        for (const n in this.clients) await this.killOne(n);
+        return "killed all";
+    }
+
+    setCursor(x, y) { this.cursor = [parseFloat(x), parseFloat(y)]; }
+    retarget(uid = 0, name = "") { this.target_uid = parseInt(uid) || 0; this.target_name = name; this.locked_uid = null; }
+    setProfile(name) { this.profile_name = name; for (const c of Object.values(this.clients)) c.profile_name = name; }
+    fireMacro(m, bot_id = null) {
+        if (bot_id && this.clients[bot_id]) this.clients[bot_id].fireMacro(m);
+        else for (const c of Object.values(this.clients)) c.fireMacro(m);
+    }
+
+    command(cmd) {
+        const p = cmd.trim().split(/\\s+/);
+        if (!p[0]) return "empty";
+        if (p[0] === "all") {
+            if (p[1] === "split") { this.fireMacro("quad_split"); return "all split"; }
+            if (p[1] === "eject") { this.fireMacro("fast_eject"); return "all eject"; }
+            if (p[1] === "stop") { this.freeze = true; return "all stop"; }
+            if (p[1] === "go") { this.freeze = false; return "all go"; }
+        }
+        if (p[0].startsWith("bt") && this.clients[p[0]] && p[1]) {
+            const c = this.clients[p[0]];
+            if (p[1] === "split") { c.fireMacro("quad_split"); return \`\${p[0]} split\`; }
+            if (p[1] === "eject") { c.fireMacro("fast_eject"); return \`\${p[0]} eject\`; }
+            if (p[1] === "profile" && p[2]) { c.profile_name = p[2]; return \`\${p[0]} -> \${p[2]}\`; }
+        }
+        if (p[0] === "target" && p.length > 1) { this.retarget(0, p.slice(1).join(' ')); return \`target -> \${p.slice(1).join(' ')}\`; }
+        return \`unknown: \${cmd}\`;
+    }
+
+    resolveTarget() {
+        const nodes = new Map();
+        for (const c of Object.values(this.clients)) {
+            if (!c.alive) continue;
+            c.nodes.forEach((v, k) => nodes.set(k, v));
+        }
+        if (this.locked_uid) return nodes.get(this.locked_uid);
+        if (this.cursor) return { x: this.cursor[0], y: this.cursor[1], size: 0.0 };
+        return null;
+    }
+
+    pickFood(c, radius = 600.0) {
+        if (!c.me) return null;
+        const foods = Array.from(c.nodes.values()).filter(n => n.size < 20 && n.size > 0);
+        if (!foods.length) return null;
+        let best = null, best_s = -1;
+        for (const f of foods.slice(0, 50)) {
+            const d = Math.hypot(f.x - c.me.x, f.y - c.me.y);
+            if (d > radius) continue;
+            const neigh = foods.filter(g => Math.abs(g.x - f.x) < 120 && Math.abs(g.y - f.y) < 120).length;
+            const score = neigh / (d + 50);
+            if (score > best_s) { best_s = score; best = f; }
+        }
+        return best;
+    }
+
+    async loop() {
+        while (this.running) {
+            await new Promise(r => setTimeout(r, 66));
+            if (!Object.keys(this.clients).length) break;
+            
+            const target = this.resolveTarget();
+            
+            // reconnect logic omitted for brevity in node port, usually handled by connection close event
+
+            for (let i = 0; i < this.order.length; i++) {
+                const bid = this.order[i];
+                const c = this.clients[bid];
+                if (!c) continue;
+                await c.respawnIfDead();
+                if (!c.alive || !c.me) continue;
+                if (this.freeze) { await c.steer(c.me.x, c.me.y, false, false, true); continue; }
+                
+                const prof = profile(c.profile_name);
+
+                if (this.heal_mode && prof.eject_rate > 0 && i > 0) {
+                    const leader = this.clients[this.order[0]];
+                    if (leader && leader.me && c.me.size > 80) {
+                        const d = Math.hypot(leader.me.x - c.me.x, leader.me.y - c.me.y);
+                        if (d < c.me.size * 3) { await c.steer(leader.me.x, leader.me.y, false, true); continue; }
+                    }
+                }
+
+                if (this.trail_mode && i > 0) {
+                    const prev = this.clients[this.order[i - 1]];
+                    if (prev && prev.me) { await c.steer(prev.me.x, prev.me.y); continue; }
+                }
+
+                if (prof.flee_radius > 0) {
+                    let danger = null;
+                    for (const n of c.nodes.values()) {
+                        if (n.size <= c.me.size * 1.2) continue;
+                        const d = Math.hypot(n.x - c.me.x, n.y - c.me.y);
+                        if (d < prof.flee_radius) { danger = n; break; }
+                    }
+                    if (danger) { await c.steer(c.me.x + (c.me.x - danger.x), c.me.y + (c.me.y - danger.y)); continue; }
+                }
+
+                if (prof.target_food) {
+                    const food = this.pickFood(c);
+                    if (food) { await c.steer(food.x, food.y); continue; }
+                }
+
+                if (target) {
+                    const d = Math.hypot(target.x - c.me.x, target.y - c.me.y);
+                    const split = c.me.size > (target.size || 0) * prof.split_size_mult && d < Math.max(c.me.size, 1.0) * prof.split_range_mult;
+                    const eject = prof.eject_rate > 0 && d < c.me.size * 2;
+                    await c.steer(target.x, target.y, split, eject);
+                } else {
+                    await c.steer(c.me.x, c.me.y, false, false, true);
+                }
+            }
+        }
+    }
+
+    positions() {
+        return Object.entries(this.clients).filter(([k, c]) => c.me).map(([k, c]) => ({ id: k, x: c.me.x, y: c.me.y, size: c.me.size, alive: c.alive, profile: c.profile_name }));
+    }
+
+    telemetry() {
+        return Object.entries(this.clients).map(([k, c]) => ({
+            id: k, name: c.nickname, profile: c.profile_name, alive: c.alive, size: c.me ? c.me.size : 0,
+            tick_hz: parseFloat(c.tick_hz.toFixed(1)), spawn_sent: c.spawn_sent, spawn_confirmed: c.spawn_confirmed,
+            reconnects: c.reconnect_count, last_ops: c.last_ops.slice(-6).map(o => '0x' + o.toString(16).toUpperCase())
+        }));
+    }
+
+    stop() {
+        this.running = false;
+        for (const c of Object.values(this.clients)) c.close();
+        this.clients = {};
+        this.order = [];
+    }
+}
+module.exports = Fleet;
+`,
+
+  'verify.js': `
+const discovery = require('./discovery');
+const AgarClient = require('./agar_client');
+
+(async () => {
+    const mode = process.argv[2] || "ffa";
+    console.log(\`[verify] findServer mode=\${mode}...\`);
+    try {
+        const { uri, key } = await discovery.findServer(mode);
+        console.log(\`[ok] server: \${uri}\`);
+        console.log(\`[ok] key: \${key.substring(0, 8)}...\`);
+
+        const c = new AgarClient(uri, "verify01", null, "", "aggressive", "", "", true);
+        c.server_key = key;
+
+        console.log("[verify] connecting...");
+        await c.connect();
+        console.log("[ok] websocket open, spawn packet sent");
+
+        const deadline = Date.now() + 6000;
+        while (Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, 100));
+            if (c.spawn_confirmed) {
+                console.log(\`[ok] SPAWN CONFIRMED — AddMyCell id=\${c.me.id}\`);
+                break;
+            }
+            if (c.kicked) {
+                console.log(\`[FAIL] kicked during spawn — ops: \${c.last_ops.map(o => '0x'+o.toString(16))}\`);
+                c.close(); return;
+            }
+        }
+
+        if (!c.spawn_confirmed) {
+            console.log(\`[FAIL] no AddMyCell in 6s — ops seen: \${c.last_ops.map(o => '0x'+o.toString(16))}\`);
+            c.close(); return;
+        }
+
+        console.log("[verify] watching for 3s post-spawn...");
+        const t0 = Date.now();
+        let died = null;
+        while (Date.now() - t0 < 3000) {
+            await new Promise(r => setTimeout(r, 100));
+            if (!c.alive) { died = (Date.now() - t0) / 1000; break; }
+        }
+
+        if (died !== null) console.log(\`[FAIL] died \${died.toFixed(2)}s after spawn — anti-bot shadow-kick likely\`);
+        else {
+            console.log("[ok] alive 3s — spawn chain WORKS");
+            await c.steer(c.center[0] + 100, c.center[1]);
+            await new Promise(r => setTimeout(r, 500));
+            console.log(\`[ok] steer sent — tick_hz=\${c.tick_hz.toFixed(1)}\`);
+        }
+        c.close();
+    } catch (e) {
+        console.log(\`[FAIL] findServer/connect: \${e.message}\`);
+    }
+})();
+`,
+
+  'server.js': `
+const express = require('express');
+const path = require('path');
+const discovery = require('./discovery');
+const Fleet = require('./fleet');
+
+const app = express();
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
+
+let fleet = null;
+
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
+
+app.post('/start', async (req, res) => {
+    const { source, bots, profile, proxies, token, target_name, target_uid, mimic, trail, heal, verbose } = req.body;
+    if (fleet) fleet.stop();
+    try {
+        const { uri, key } = await discovery.resolveUri(source || 'ffa');
+        const plist = (proxies || '').split('\\n').filter(p => p.trim());
+        fleet = new Fleet(uri, token || '', plist, target_uid || 0, target_name || '', profile || 'aggressive', source.startsWith('party:') ? source : '', !!mimic, !!trail, !!heal, true, !!verbose);
+        await fleet.spawnMany(parseInt(bots) || 5);
+        res.send(\`fleet -> \${uri} | key=\${key.substring(0,8) || 'none'}... | \${bots} bots | spawn packets sent\`);
+    } catch (e) {
+        res.status(500).send(\`start failed: \${e.message}\`);
+    }
+});
+
+app.post('/chat', (req, res) => {
+    if (!fleet) return res.send("no fleet");
+    res.send(fleet.command(req.body.cmd));
+});
+
+app.post('/cursor', (req, res) => {
+    if (!fleet) return res.send("no fleet");
+    fleet.setCursor(req.body.x, req.body.y);
+    res.send(\`cursor -> \${req.body.x},\${req.body.y}\`);
+});
+
+app.post('/freeze', (req, res) => {
+    if (!fleet) return res.send("no fleet");
+    fleet.freeze = !fleet.freeze;
+    res.send(\`freeze \${fleet.freeze ? 'on' : 'off'}\`);
+});
+
+app.post('/spawn', async (req, res) => {
+    if (!fleet) return res.send("no fleet");
+    const result = await fleet.spawnMany(parseInt(req.body.bots) || 1);
+    res.send(result.join('\\n'));
+});
+
+app.post('/kill', async (req, res) => {
+    if (!fleet) return res.send("no fleet");
+    res.send(await fleet.killOne(req.body.name));
+});
+
+app.post('/retarget', (req, res) => {
+    if (!fleet) return res.send("no fleet");
+    fleet.retarget(req.body.uid, req.body.name);
+    res.send(\`retarget -> \${req.body.uid || '?'}/\${req.body.name || '?'}\`);
+});
+
+app.post('/macro/:name', (req, res) => {
+    if (!fleet) return res.send("no fleet");
+    fleet.fireMacro(req.params.name);
+    res.send(\`macro \${req.params.name} fired\`);
+});
+
+app.post('/stop', (req, res) => {
+    if (fleet) { fleet.stop(); fleet = null; res.send("stopped"); }
+    else res.send("none");
+});
+
+app.get('/bots', (req, res) => {
+    if (!fleet) return res.json({ bots: [], target: null, party: null, freeze: false });
+    res.json({
+        bots: fleet.telemetry(),
+        target: { uid: fleet.locked_uid, name: fleet.target_name },
+        party: fleet.party_code || null,
+        freeze: fleet.freeze
+    });
+});
+
+app.get('/positions', (req, res) => {
+    res.json({ bots: fleet ? fleet.positions() : [] });
+});
+
+const PORT = process.env.PORT || 8077;
+app.listen(PORT, () => console.log(\`[panel] node running on \${PORT}\`));
+`,
+
+  'index.html': `
+<!doctype html><html><head><title>biteyt node v4</title>
+<style>
+body{background:#0a0a0f;color:#e0e0e0;font-family:monospace;padding:1.5rem;max-width:1100px;margin:auto;font-size:.9rem}
+input,button,textarea,select{width:100%;padding:.5rem;margin:.2rem 0;background:#151520;color:#e0e0e0;border:1px solid #333;font-family:monospace;box-sizing:border-box}
+button{background:#1f1f2e;cursor:pointer}button:hover{background:#2a2a3e}
+.row{display:flex;gap:.5rem}.row>*{flex:1}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+#log{background:#111118;border:1px solid #222;padding:.75rem;height:140px;overflow-y:auto;white-space:pre-wrap;font-size:.8rem}
+#hud{background:#111118;border:1px solid #222;padding:.75rem;margin-top:.5rem;font-size:.8rem}
+#hud table{width:100%;border-collapse:collapse}
+#hud td,#hud th{padding:.2rem .4rem;text-align:left;border-bottom:1px solid #222}
+#map{background:#000;border:1px solid #222;width:100%;height:340px}
+h3{border-bottom:1px solid #333;padding-bottom:.2rem;margin-top:1rem}
+#chat{background:#111118;border:1px solid #222;padding:.75rem;height:140px;overflow-y:auto;font-size:.8rem;white-space:pre-wrap}
+</style></head><body>
+<h2>biteyt node v4</h2>
+<div class="grid"><div>
+<h3>start fleet</h3>
+<form id="startform">
+  <div class="row">
+    <div><label>source</label><input name="source" value="ffa" placeholder="ffa | party:US-XXX | wss://host"></div>
+    <div><label>bots</label><input name="bots" type="number" value="5" min="1" max="50"></div>
+  </div>
+  <div class="row">
+    <div><label>profile</label><select name="profile">
+      <option value="aggressive">aggressive</option><option value="farmer">farmer</option>
+      <option value="feeder">feeder</option><option value="sniper">sniper</option>
+      <option value="trail">trail</option><option value="healer">healer</option>
+    </select></div>
+    <div><label>verbose</label><label><input type="checkbox" name="verbose" value="1" style="width:auto"> log packets</label></div>
+  </div>
+  <label>proxies (one per line)</label><textarea name="proxies" rows="2"></textarea>
+  <label>auth token</label><input name="token" placeholder="optional">
+  <div class="row">
+    <div><label>target name</label><input name="target_name"></div>
+    <div><label>target uid</label><input name="target_uid" placeholder="0=none"></div>
+  </div>
+  <div class="row">
+    <div><label><input type="checkbox" name="mimic" style="width:auto"> mimic</label></div>
+    <div><label><input type="checkbox" name="trail" style="width:auto"> trail</label></div>
+    <div><label><input type="checkbox" name="heal" style="width:auto"> heal</label></div>
+  </div>
+  <button type="submit">start</button>
+</form>
+<button id="mkparty">create party code</button>
+<button id="stop" style="background:#3a1a1a">stop</button>
+<h3>chat console</h3>
+<form id="chatf">
+  <input name="cmd" placeholder="bt00 split | all eject | target Nick">
+  <button type="submit">run</button>
+</form>
+<div id="chat"></div>
+<h3>macros</h3>
+<button onclick="macro('quad_split')">quad split</button>
+<button onclick="macro('fast_eject')">fast eject</button>
+<button onclick="macro('split_pop')">split pop</button>
+</div><div>
+<h3>map</h3>
+<canvas id="map" width="600" height="340"></canvas>
+<h3>fleet</h3>
+<button onclick="spawn(1)">+1</button>
+<button onclick="spawn(5)">+5</button>
+<button onclick="killAll()">kill all</button>
+<button onclick="toggleFreeze()" id="freezebtn">freeze: off</button>
+<h3>cursor</h3>
+<form id="cursorform">
+  <div class="row"><div><label>X</label><input name="x" value="0"></div>
+  <div><label>Y</label><input name="y" value="0"></div></div>
+  <button type="submit">set</button>
+</form>
+<h3>retarget</h3>
+<form id="retargetform">
+  <div class="row"><div><input name="uid" placeholder="uid"></div>
+  <div><input name="name" placeholder="name"></div></div>
+  <button type="submit">retarget</button>
+</form>
+</div></div>
+<div id="hud"></div>
+<div id="log"></div>
+<script>
+const log=m=>{const d=document.getElementById('log');d.textContent+=m+"\\n";d.scrollTop=1e9};
+const chat=m=>{const d=document.getElementById('chat');d.textContent+=m+"\\n";d.scrollTop=1e9};
+document.getElementById('mkparty').onclick=async()=>{const r=await fetch('/party/create',{method:'POST'});log(await r.text())};
+document.getElementById('startform').onsubmit=async e=>{e.preventDefault();
+  const fd=new FormData(e.target);
+  for(const k of ['mimic','trail','heal','verbose']) fd.set(k, fd.get(k)?'1':'');
+  const r=await fetch('/start',{method:'POST',body:new URLSearchParams(fd)});log(await r.text())};
+document.getElementById('chatf').onsubmit=async e=>{e.preventDefault();const fd=new FormData(e.target);
+  const r=await fetch('/chat',{method:'POST',body:new URLSearchParams(fd)});chat('> '+fd.get('cmd')+' → '+await r.text());e.target.reset()};
+document.getElementById('cursorform').onsubmit=async e=>{e.preventDefault();const r=await fetch('/cursor',{method:'POST',body:new URLSearchParams(new FormData(e.target))});log(await r.text())};
+document.getElementById('retargetform').onsubmit=async e=>{e.preventDefault();const r=await fetch('/retarget',{method:'POST',body:new URLSearchParams(new FormData(e.target))});log(await r.text())};
+document.getElementById('stop').onclick=async()=>{const r=await fetch('/stop',{method:'POST'});log(await r.text())};
+async function spawn(n){const fd=new URLSearchParams();fd.append('bots',n);const r=await fetch('/spawn',{method:'POST',body:fd});log(await r.text())}
+async function killAll(){const j=await (await fetch('/bots')).json();for(const b of j.bots){const fd=new URLSearchParams();fd.append('name',b.id);await fetch('/kill',{method:'POST',body:fd})}log('all killed')}
+async function macro(m){const r=await fetch('/macro/'+m,{method:'POST'});log(await r.text())}
+async function toggleFreeze(){const r=await fetch('/freeze',{method:'POST'});const t=await r.text();log(t);document.getElementById('freezebtn').textContent='freeze: '+(t.includes('on')?'on':'off')}
+const cv=document.getElementById('map');const ctx=cv.getContext('2d');
+async function refreshHud(){try{
+  const j=await (await fetch('/bots')).json();
+  const alive=j.bots.filter(b=>b.alive).length;
+  const confirmed=j.bots.filter(b=>b.spawn_confirmed).length;
+  let rows=j.bots.map(b=>\`<tr><td>\${b.id}</td><td>\${b.name}</td><td>\${b.profile}</td><td>\${b.alive?'✓':'✗'}</td><td>\${b.spawn_confirmed?'C':'-'}</td><td>\${Math.round(b.size)}</td><td>\${b.tick_hz}Hz</td><td>\${b.reconnects}</td><td>\${(b.last_ops||[]).join(' ')}</td></tr>\`).join('');
+  document.getElementById('hud').innerHTML=\`<div>alive \${alive}/\${j.bots.length} | spawn_confirmed \${confirmed} | target \${j.target?.uid||'-'} / \${j.target?.name||'-'} | party \${j.party||'-'}</div><table><tr><th>id</th><th>name</th><th>profile</th><th>alive</th><th>spawn</th><th>size</th><th>rate</th><th>rc</th><th>ops</th></tr>\${rows}</table>\`;
+  document.title=\`\${alive}/\${j.bots.length} alive\`;
+  const p=await (await fetch('/positions')).json();
+  ctx.fillStyle='#000';ctx.fillRect(0,0,cv.width,cv.height);
+  if(p.bots.length){
+    const xs=p.bots.map(b=>b.x),ys=p.bots.map(b=>b.y);
+    const minX=Math.min(...xs),maxX=Math.max(...xs),minY=Math.min(...ys),maxY=Math.max(...ys);
+    const w=Math.max(maxX-minX,200),h=Math.max(maxY-minY,200);
+    const pad=20,sx=(cv.width-2*pad)/w,sy=(cv.height-2*pad)/h;
+    for(const b of p.bots){
+      const px=pad+(b.x-minX)*sx,py=pad+(b.y-minY)*sy;
+      ctx.beginPath();ctx.arc(px,py,Math.max(3,Math.sqrt(b.size)*0.6),0,Math.PI*2);
+      ctx.fillStyle=b.alive?'#5af':'#a33';ctx.fill();
+      ctx.fillStyle='#aaa';ctx.font='10px monospace';ctx.fillText(b.id,px+5,py-5);
+    }
+  }
+}catch(e){}}
+setInterval(refreshHud,2000);
+</script></body></html>
+`,
+
+  'run.js': `
+process.env.NODE_ENV = 'production';
+require('./server.js');
+`
+};
+
+for (const [filename, content] of Object.entries(FILES)) {
+    fs.writeFileSync(path.join(ROOT, filename), content.trim());
+    console.log(`[write] ${ROOT}/${filename}`);
+}
+
+try {
+    execSync(`zip -r ${ROOT}.zip ${ROOT}`, { stdio: 'inherit' });
+    console.log(`[zip]   ${ROOT}.zip built.`);
+} catch (e) {
+    console.log('[warn] zip command failed. Install zip or zip it manually.');
+}
